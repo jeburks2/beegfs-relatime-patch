@@ -1,0 +1,166 @@
+# Author: Josh Burks <jeburks2@asu.edu>
+# Date: 2026-03-09
+#
+# Description: 
+# Patches BeeGFS client 8.2.2 to update file atimes on read using relatime semantics
+# Adjust the relatime with tuneRelatimeSecs in the beegfs-client.conf
+# Place this file in /opt/beegfs/src/client/client_module_8 
+# Then run: patch -p1 --forward --batch < beegfs-8.2.2-relatime.patch
+
+diff --git a/source/app/config/Config.c b/source/app/config/Config.c
+index 685bae7..8e874a6 100644
+--- a/source/app/config/Config.c
++++ b/source/app/config/Config.c
+@@ -284,6 +284,7 @@ void _Config_loadDefaults(Config* this)
+    _Config_configMapRedefine(this, "tuneUseBufferedAppend",            "true");
+    _Config_configMapRedefine(this, "tuneStatFsCacheSecs",              "10");
+    _Config_configMapRedefine(this, "tuneCoherentBuffers",              "true");
++   _Config_configMapRedefine(this, "tuneRelatimeSecs",                 "86400");
+ 
+    _Config_configMapRedefine(this, "sysMgmtdHost",                     "");
+    _Config_configMapRedefine(this, "sysInodeIDStyle",                  INODEIDSTYLE_DEFAULT);
+@@ -677,6 +678,9 @@ bool _Config_applyConfigMap(Config* this)
+       if(!strcmp(keyStr, "tuneCoherentBuffers") )
+          this->tuneCoherentBuffers = StringTk_strToBool(valueStr);
+       else
++      if(!strcmp(keyStr, "tuneRelatimeSecs") )
++          this->tuneRelatimeSecs = StringTk_strToUInt(valueStr);
++      else
+       if(!strcmp(keyStr, "sysInodeIDStyle") )
+       {
+          SAFE_KFREE(this->sysInodeIDStyle);
+diff --git a/source/app/config/Config.h b/source/app/config/Config.h
+index d1577d6..0ac1ff3 100644
+--- a/source/app/config/Config.h
++++ b/source/app/config/Config.h
+@@ -314,7 +314,8 @@ struct Config
+    bool     tuneUseBufferedAppend; // false disables buffering of append writes
+    unsigned       tuneStatFsCacheSecs; // 0 disables caching of free space info from servers
+    bool           tuneCoherentBuffers; // try to keep buffer cache and page cache coherent
+-
++   unsigned tuneRelatimeSecs; // 0 disables relatime atime updates
++   
+    char*          sysMgmtdHost;
+    char*          sysInodeIDStyle;
+    InodeIDStyle   sysInodeIDStyleNum; // auto-generated based on sysInodeIDStyle
+diff --git a/source/filesystem/FhgfsOpsFile.c b/source/filesystem/FhgfsOpsFile.c
+index 5224219..e0e6f40 100644
+--- a/source/filesystem/FhgfsOpsFile.c
++++ b/source/filesystem/FhgfsOpsFile.c
+@@ -997,6 +997,13 @@ static ssize_t read_common(struct file *file, struct iov_iter *iter, size_t size
+ 
+       FsFileInfo_setLastReadOffset(fileInfo, *offsetPointer);
+    }
++      // Update atime on successful reads if relatime is enabled
++   if (readRes > 0 &&
++       app->cfg->tuneRelatimeSecs > 0 &&
++       __FhgfsOpsHelper_shouldUpdateAtime(inode, app->cfg->tuneRelatimeSecs))
++   {
++      __FhgfsOpsHelper_updateAtime(app, inode, fhgfsInode);
++   }
+ 
+    // add to /proc/<pid>/io
+    task_io_account_read(readRes);
+diff --git a/source/filesystem/FhgfsOpsHelper.c b/source/filesystem/FhgfsOpsHelper.c
+index 758da5c..ab8b575 100644
+--- a/source/filesystem/FhgfsOpsHelper.c
++++ b/source/filesystem/FhgfsOpsHelper.c
+@@ -1370,3 +1370,83 @@ FhgfsOpsErr FhgfsOpsHelper_flushCache(App* app, FhgfsInode* fhgfsInode,
+ 
+    return retVal;
+ }
++
++
++/**
++ * Check if atime should be updated according to relatime semantics.
++ *
++ * @param inode the inode to check
++ * @param relatimeSecs threshold in seconds (0 = disabled)
++ * @return true if atime should be updated
++ */
++bool __FhgfsOpsHelper_shouldUpdateAtime(struct inode* inode, unsigned relatimeSecs)
++{
++   Time now, atime, mtime, ctime;
++   long long atime_age_secs;
++
++   if (relatimeSecs == 0)
++      return false; // relatime disabled
++
++   Time_setToNowReal(&now);
++   atime.tv_sec = inode_get_atime_sec(inode);
++   atime.tv_nsec = inode_get_atime_nsec(inode);
++   mtime.tv_sec = inode_get_mtime_sec(inode);
++   mtime.tv_nsec = inode_get_mtime_nsec(inode);
++   ctime.tv_sec = inode_get_ctime_sec(inode);
++   ctime.tv_nsec = inode_get_ctime_nsec(inode);
++
++   // Always update if atime < mtime or atime < ctime (file was modified)
++   if (Time_compare(&atime, &mtime) < 0 || Time_compare(&atime, &ctime) < 0)
++      return true;
++
++   // Update if atime is older than threshold
++   atime_age_secs = now.tv_sec - atime.tv_sec;
++   return (atime_age_secs >= relatimeSecs);
++}
++
++/**
++ * Update atime for an inode using best-effort approach.
++ * This function performs the actual metadata server communication.
++ *
++ * @param app application context
++ * @param inode the inode to update
++ * @param fhgfsInode the BeeGFS inode (for entryInfo locking)
++ */
++void __FhgfsOpsHelper_updateAtime(App* app, struct inode* inode, FhgfsInode* fhgfsInode)
++{
++   Logger* log = App_getLogger(app);
++   const char* logContext = "__FhgfsOpsHelper_updateAtime";
++   FhgfsOpsErr setAttrRes;
++   SettableFileAttribs settableAttribs;
++   Time now;
++   int validAttribs;
++
++   // Prepare new atime
++   Time_setToNowReal(&now);
++
++   // Initialize settable attributes for atime only
++   memset(&settableAttribs, 0, sizeof(settableAttribs));
++   settableAttribs.lastAccessTimeSecs = now.tv_sec;
++
++   // Set only atime flag
++   validAttribs = SETATTR_CHANGE_LASTACCESSTIME;
++
++   FhgfsInode_entryInfoReadLock(fhgfsInode); // LOCK EntryInfo
++
++   // Update on metadata server (best effort)
++   setAttrRes = FhgfsOpsRemoting_setAttr(app, FhgfsInode_getEntryInfo(fhgfsInode),
++      &settableAttribs, validAttribs, NULL);
++
++   FhgfsInode_entryInfoReadUnlock(fhgfsInode); // UNLOCK EntryInfo
++
++   if (likely(setAttrRes == FhgfsOpsErr_SUCCESS))
++   {
++      // Update local inode cache on success
++      inode_set_atime(inode, now.tv_sec, now.tv_nsec);
++
++      if (unlikely(Logger_getLogLevel(log) >= Log_SPAM))
++         FhgfsOpsHelper_logOpMsg(Log_SPAM, app, NULL, inode, logContext, "Updated atime to %lld", (long long)now.tv_sec);
++
++   }
++   // Note: We don't handle errors - this is best effort and shouldn't fail reads
++}
+\ No newline at end of file
+diff --git a/source/filesystem/FhgfsOpsHelper.h b/source/filesystem/FhgfsOpsHelper.h
+index 0391fb9..2b59733 100644
+--- a/source/filesystem/FhgfsOpsHelper.h
++++ b/source/filesystem/FhgfsOpsHelper.h
+@@ -58,6 +58,9 @@ ssize_t FhgfsOpsHelper_appendfileVecOffset(FhgfsInode* fhgfsInode, struct iov_it
+ extern FhgfsOpsErr FhgfsOpsHelper_readOrClearUser(App* app, struct iov_iter *iter, size_t size,
+    loff_t offset, FsFileInfo* fileInfo, RemotingIOInfo* ioInfo);
+ 
++extern bool __FhgfsOpsHelper_shouldUpdateAtime(struct inode* inode, unsigned relatimeSecs);
++extern void __FhgfsOpsHelper_updateAtime(App* app, struct inode* inode, FhgfsInode* fhgfsInode);
++
+ extern void FhgfsOpsHelper_getRelativeLinkStr(const char* pathFrom, const char* pathTo,
+    char** pathRelativeTo);
+ extern int FhgfsOpsHelper_symlink(App* app, const EntryInfo* parentInfo, const char* to,

@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![BeeGFS 7.4.6](https://img.shields.io/badge/BeeGFS-7.4.6-blue.svg)](#supported-versions)
+[![BeeGFS 7.4.7](https://img.shields.io/badge/BeeGFS-7.4.7-blue.svg)](#supported-versions)
 [![BeeGFS 8.2.2](https://img.shields.io/badge/BeeGFS-8.2.2-blue.svg)](#supported-versions)
 
 Patch files for BeeGFS client to enable atime updates on read-only operations using relatime semantics.
@@ -46,6 +47,7 @@ This provides accurate atime tracking for applications that depend on access tim
 | BeeGFS Version | Patch File                    |
 |----------------|-------------------------------|
 | 7.4.6          | `beegfs-7.4.6-relatime.patch` |
+| 7.4.7          | `beegfs-7.4.7-relatime.patch` |
 | 8.2.2          | `beegfs-8.2.2-relatime.patch` |
 
 ## Prerequisites
@@ -53,7 +55,6 @@ This provides accurate atime tracking for applications that depend on access tim
 - **Operating System**: RHEL-based distributions (RHEL, CentOS, Rocky Linux, AlmaLinux, Fedora)
 - **Privileges**: Root access required
 - **BeeGFS Client**: Must be installed and available via RPM
-- **Build Tools**: Development tools for kernel module compilation
 
 ## Installation
 
@@ -74,12 +75,12 @@ sudo ./install.sh
 
 ```bash
 # View help and all available options
-sudo ./install.sh --help
+./install.sh --help
 
-# Install patch but skip automatic rebuild (useful for CI/build environments)
+# Install patch but skip automatic rebuild kernel module and service restart
 sudo ./install.sh --norebuild
 
-# Install in container/chroot (automatically detected, but no rebuild performed)
+# Install patch and rebuild client and restart service
 sudo ./install.sh
 ```
 
@@ -105,8 +106,6 @@ Restarting BeeGFS client service...
 ```
 
 ### Manual Installation
-
-For advanced users or custom deployment scenarios:
 
 1. **Download the appropriate patch file** for your BeeGFS client version
 
@@ -191,16 +190,16 @@ The patch adds a `tuneRelatimeSecs` parameter to control the atime update behavi
 
 **Default value**: `86400` seconds (24 hours)
 
-**Configuration location**: `/etc/beegfs/beegfs-client.conf`
+**To change the threshold, add the following line to your `beegfs-client.conf` file:**
 
 ```ini
-# Add this line to your beegfs-client.conf
+# If atime is older than this many seconds on a read operation, update the atime (default: 86400 seconds = 24 hours)
 tuneRelatimeSecs = 86400
 ```
 
 **Configuration options**:
 
-- `0`: Update atime on every read (equivalent to `atime` mount option)
+- `0`: Skips checking if atime should be updated on read-only operations, effectively disabling this patch
 - `> 0`: Update atime only if current atime is older than specified seconds
 - Default `86400`: Update atime if older than 24 hours
 
@@ -227,25 +226,29 @@ Performance testing shows minimal impact on read-only workloads:
 | 555.45         | With Patch   |
 | 537.04         | With Patch   |
 
+Average time **without** patch: 541.21 seconds
+Average time **with** patch: 544.45 seconds
+Difference: 3.24 seconds (0.6% increase)
+
 **Result**: No statistically significant performance difference between patched and unpatched clients.
 
 ## Verification
 
 ### Verify Patch Installation
 
-1. **Check for patch-specific configuration**:
-
-   ```bash
-   grep -i relatime /etc/beegfs/beegfs-client.conf
-   ```
-
-2. **Monitor atime updates**:
+**Monitor atime updates**:
 
    ```bash
    # Create test file
    echo "test" > /path/to/beegfs/testfile
    
    # Check initial times
+   stat /path/to/beegfs/testfile
+
+   # Set atime to sometime in the past
+   touch -a -d "2 days ago" /path/to/beegfs/testfile
+
+   # Check times after setting atime
    stat /path/to/beegfs/testfile
    
    # Read the file
@@ -266,6 +269,7 @@ The installer automatically detects container and chroot environments and adapts
 - **Chroot environments**
 - **Mock build environments**
 - **RPM build environments**
+- **Warewulf build environments**
 
 ### Automatic Detection
 

@@ -7,19 +7,11 @@
 # Place this file in /opt/beegfs/src/client/client_module_7 
 # Then run: patch -p1 --forward --batch < beegfs-7.4.6-relatime.patch
 
---- a/source/app/config/Config.h	2026-02-25 19:49:40.614575227 -0700
-+++ source/app/config/Config.h	2026-02-25 20:35:59.585748513 -0700
-@@ -297,6 +297,7 @@
-    bool     tuneUseBufferedAppend; // false disables buffering of append writes
-    unsigned       tuneStatFsCacheSecs; // 0 disables caching of free space info from servers
-    bool           tuneCoherentBuffers; // try to keep buffer cache and page cache coherent
-+   unsigned       tuneRelatimeSecs; // 0 disables relatime atime updates
- 
-    char*          sysMgmtdHost;
-    char*          sysInodeIDStyle;
---- a/source/app/config/Config.c	2026-02-25 19:49:40.614575227 -0700
-+++ source/app/config/Config.c	2026-02-25 20:35:59.608748808 -0700
-@@ -275,6 +275,7 @@
+diff --git a/source/app/config/Config.c b/source/app/config/Config.c
+index df3c12c..f06cce5 100644
+--- a/source/app/config/Config.c
++++ b/source/app/config/Config.c
+@@ -275,6 +275,7 @@ void _Config_loadDefaults(Config* this)
     _Config_configMapRedefine(this, "tuneUseBufferedAppend",            "true");
     _Config_configMapRedefine(this, "tuneStatFsCacheSecs",              "10");
     _Config_configMapRedefine(this, "tuneCoherentBuffers",              "true");
@@ -27,7 +19,7 @@
  
     _Config_configMapRedefine(this, "sysMgmtdHost",                     "");
     _Config_configMapRedefine(this, "sysInodeIDStyle",                  INODEIDSTYLE_DEFAULT);
-@@ -662,6 +663,9 @@
+@@ -662,6 +663,9 @@ bool _Config_applyConfigMap(Config* this, bool enableException)
        if(!strcmp(keyStr, "tuneCoherentBuffers") )
           this->tuneCoherentBuffers = StringTk_strToBool(valueStr);
        else
@@ -37,21 +29,42 @@
        if(!strcmp(keyStr, "sysMgmtdHost") )
        {
           SAFE_KFREE(this->sysMgmtdHost);
---- a/source/filesystem/FhgfsOpsHelper.h	2025-03-05 01:52:33.000000000 -0700
-+++ source/filesystem/FhgfsOpsHelper.h	2026-02-25 20:35:59.585748513 -0700
-@@ -58,6 +58,9 @@
- extern FhgfsOpsErr FhgfsOpsHelper_readOrClearUser(App* app, struct iov_iter *iter, size_t size,
-    loff_t offset, FsFileInfo* fileInfo, RemotingIOInfo* ioInfo);
+diff --git a/source/app/config/Config.h b/source/app/config/Config.h
+index ea2382f..128febf 100644
+--- a/source/app/config/Config.h
++++ b/source/app/config/Config.h
+@@ -297,6 +297,7 @@ struct Config
+    bool     tuneUseBufferedAppend; // false disables buffering of append writes
+    unsigned       tuneStatFsCacheSecs; // 0 disables caching of free space info from servers
+    bool           tuneCoherentBuffers; // try to keep buffer cache and page cache coherent
++   unsigned       tuneRelatimeSecs; // 0 disables relatime atime updates
  
-+extern bool __FhgfsOpsHelper_shouldUpdateAtime(struct inode* inode, unsigned relatimeSecs);
-+extern void __FhgfsOpsHelper_updateAtime(App* app, struct inode* inode, FhgfsInode* fhgfsInode);
+    char*          sysMgmtdHost;
+    char*          sysInodeIDStyle;
+diff --git a/source/filesystem/FhgfsOpsFile.c b/source/filesystem/FhgfsOpsFile.c
+index 34d8c9a..9e17405 100644
+--- a/source/filesystem/FhgfsOpsFile.c
++++ b/source/filesystem/FhgfsOpsFile.c
+@@ -999,6 +999,14 @@ static ssize_t read_common(struct file *file, struct iov_iter *iter, size_t size
+       FsFileInfo_setLastReadOffset(fileInfo, *offsetPointer);
+    }
+ 
++   // Update atime on successful reads if relatime is enabled
++   if (readRes > 0 &&
++       app->cfg->tuneRelatimeSecs > 0 &&
++       __FhgfsOpsHelper_shouldUpdateAtime(inode, app->cfg->tuneRelatimeSecs))
++   {
++      __FhgfsOpsHelper_updateAtime(app, inode, fhgfsInode);
++   }
 +
- extern void FhgfsOpsHelper_getRelativeLinkStr(const char* pathFrom, const char* pathTo,
-    char** pathRelativeTo);
- extern int FhgfsOpsHelper_symlink(App* app, const EntryInfo* parentInfo, const char* to,
---- a/source/filesystem/FhgfsOpsHelper.c	2025-03-05 01:52:33.000000000 -0700
-+++ source/filesystem/FhgfsOpsHelper.c	2026-02-25 20:36:34.426195103 -0700
-@@ -1370,3 +1370,82 @@
+    // add to /proc/<pid>/io
+    task_io_account_read(readRes);
+ 
+diff --git a/source/filesystem/FhgfsOpsHelper.c b/source/filesystem/FhgfsOpsHelper.c
+index 758da5c..bf6c5ad 100644
+--- a/source/filesystem/FhgfsOpsHelper.c
++++ b/source/filesystem/FhgfsOpsHelper.c
+@@ -1370,3 +1370,82 @@ FhgfsOpsErr FhgfsOpsHelper_flushCache(App* app, FhgfsInode* fhgfsInode,
  
     return retVal;
  }
@@ -134,20 +147,17 @@
 +   }
 +   // Note: We don't handle errors - this is best effort and shouldn't fail reads
 +}
---- a/source/filesystem/FhgfsOpsFile.c	2025-03-05 01:52:33.000000000 -0700
-+++ source/filesystem/FhgfsOpsFile.c	2026-02-25 20:35:59.585748513 -0700
-@@ -999,6 +999,14 @@
-       FsFileInfo_setLastReadOffset(fileInfo, *offsetPointer);
-    }
+diff --git a/source/filesystem/FhgfsOpsHelper.h b/source/filesystem/FhgfsOpsHelper.h
+index 0391fb9..2b59733 100644
+--- a/source/filesystem/FhgfsOpsHelper.h
++++ b/source/filesystem/FhgfsOpsHelper.h
+@@ -58,6 +58,9 @@ ssize_t FhgfsOpsHelper_appendfileVecOffset(FhgfsInode* fhgfsInode, struct iov_it
+ extern FhgfsOpsErr FhgfsOpsHelper_readOrClearUser(App* app, struct iov_iter *iter, size_t size,
+    loff_t offset, FsFileInfo* fileInfo, RemotingIOInfo* ioInfo);
  
-+   // Update atime on successful reads if relatime is enabled
-+   if (readRes > 0 &&
-+       app->cfg->tuneRelatimeSecs > 0 &&
-+       __FhgfsOpsHelper_shouldUpdateAtime(inode, app->cfg->tuneRelatimeSecs))
-+   {
-+      __FhgfsOpsHelper_updateAtime(app, inode, fhgfsInode);
-+   }
++extern bool __FhgfsOpsHelper_shouldUpdateAtime(struct inode* inode, unsigned relatimeSecs);
++extern void __FhgfsOpsHelper_updateAtime(App* app, struct inode* inode, FhgfsInode* fhgfsInode);
 +
-    // add to /proc/<pid>/io
-    task_io_account_read(readRes);
- 
+ extern void FhgfsOpsHelper_getRelativeLinkStr(const char* pathFrom, const char* pathTo,
+    char** pathRelativeTo);
+ extern int FhgfsOpsHelper_symlink(App* app, const EntryInfo* parentInfo, const char* to,

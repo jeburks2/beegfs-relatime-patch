@@ -93,16 +93,20 @@ Detecting BeeGFS client version...
 ✓ Found BeeGFS client version: 8.2.2
 Locating BeeGFS client source directory...
 ✓ BeeGFS client version 8 detected
+ℹ Detected container/podman environment
+ℹ BeeGFS client service is not running
 Checking for patch file...
 ✓ Found patch file: beegfs-8.2.2-relatime.patch
-✓ BeeGFS client service is currently running
 Applying BeeGFS relatime patch for version 8.2.2...
+patching file source/app/config/Config.c
+patching file source/app/config/Config.h
+patching file source/filesystem/FhgfsOpsFile.c
+patching file source/filesystem/FhgfsOpsHelper.c
+patching file source/filesystem/FhgfsOpsHelper.h
 ✓ Patch applied successfully
-Rebuilding the BeeGFS client...
-✓ BeeGFS client rebuilt successfully
-Restarting BeeGFS client service...
-✓ BeeGFS client service restarted successfully
-✓ BeeGFS relatime patch installation completed successfully!
+ℹ Skipping BeeGFS client rebuild and service operations (chroot/container environment detected)
+✓ BeeGFS relatime patch applied successfully!
+Note: You will need to rebuild the client and restart services manually in the target environment.
 ```
 
 ### Manual Installation
